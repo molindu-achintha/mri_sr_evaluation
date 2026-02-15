@@ -19,8 +19,8 @@ PATH_LABELS = os.path.join(REPO_PATH, 'data', 'labels_classes_priors', 'synthseg
 from SynthSeg.predict import predict
 
 # --- CONFIGURATION ---
-INPUT_DIR = './data/proposed/HR'
-OUTPUT_DIR = './outputs'
+INPUT_DIR = '../data/proposed/HR'
+OUTPUT_DIR = '../outputs'
 CSV_FILENAME = 'brain_volumes.csv'
 SAVE_SEGMENTATION = False  # Set to True to keep .nii files, False to delete them after extraction
 
