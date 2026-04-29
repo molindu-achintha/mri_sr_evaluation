@@ -1,4 +1,13 @@
 import os
+
+# TensorFlow must see this before it is imported by SynthSeg. The original
+# crash is usually caused by TensorFlow finding a GPU but failing to initialise
+# the CUDA/cuDNN DNN runtime in the container.
+USE_GPU = os.environ.get("USE_SYNTHSEG_GPU", "0") == "1"
+if not USE_GPU:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import numpy as np
 import pandas as pd
 import nibabel as nib
@@ -14,6 +23,16 @@ sys.path.append(REPO_PATH)
 # Define paths to model and labels
 PATH_MODEL = os.path.join(REPO_PATH, 'models', 'synthseg_1.0.h5')
 PATH_LABELS = os.path.join(REPO_PATH, 'data', 'labels_classes_priors', 'synthseg_segmentation_labels.npy')
+
+# Configure TensorFlow before importing SynthSeg's prediction module.
+import tensorflow as tf
+
+TF_THREADS = int(os.environ.get("SYNTHSEG_THREADS", "1"))
+tf.config.threading.set_inter_op_parallelism_threads(TF_THREADS)
+tf.config.threading.set_intra_op_parallelism_threads(TF_THREADS)
+if USE_GPU:
+    for gpu in tf.config.list_physical_devices("GPU"):
+        tf.config.experimental.set_memory_growth(gpu, True)
 
 # Correct Import for the official SynthSeg Repo
 from SynthSeg.predict import predict
@@ -66,21 +85,17 @@ def get_voxel_volume(nii_img):
     zooms = header.get_zooms()
     return np.prod(zooms)
 
-def process_brain_mri(input_path, output_folder):
+def get_segmentation_path(input_path, segmentation_folder):
     filename = os.path.basename(input_path)
-    seg_output_path = os.path.join(output_folder, f"seg_{filename}")
-    
-    # 1. Run Inference (SynthSeg)
-    # The predict function handles loading, inference, and saving
-    predict(
-        path_images=input_path,
-        path_segmentations=seg_output_path,
-        path_model=PATH_MODEL,
-        labels_segmentation=PATH_LABELS,
-        cropping=None  # Can set to e.g. [192, 192, 192] if you run out of memory
-    )
+    if filename.endswith(".nii.gz"):
+        return os.path.join(segmentation_folder, filename.replace(".nii.gz", "_synthseg.nii.gz"))
+    return os.path.join(segmentation_folder, filename.replace(".nii", "_synthseg.nii"))
 
-    # 2. Calculate Volumes from the new segmentation
+
+def extract_volumes(input_path, seg_output_path):
+    filename = os.path.basename(input_path)
+
+    # Calculate volumes from the SynthSeg segmentation.
     seg_img = nib.load(seg_output_path)
     seg_data = seg_img.get_fdata()
     voxel_vol_mm3 = get_voxel_volume(seg_img)
@@ -94,18 +109,15 @@ def process_brain_mri(input_path, output_folder):
         count = stats.get(label_id, 0)
         volumes[label_name] = count * voxel_vol_mm3
 
-    # Clean up segmentation file if not needed
-    if not SAVE_SEGMENTATION:
-        if os.path.exists(seg_output_path):
-            os.remove(seg_output_path)
-
     return volumes
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    segmentation_dir = os.path.join(OUTPUT_DIR, "synthseg_segmentations")
+    os.makedirs(segmentation_dir, exist_ok=True)
     
     # Filter for NIfTI files
-    files = [f for f in os.listdir(INPUT_DIR) if f.endswith(('.nii', '.nii.gz'))]
+    files = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(('.nii', '.nii.gz')))
     
     if not files:
         print(f"No NIfTI files found in {INPUT_DIR}")
@@ -113,14 +125,28 @@ def main():
         return
 
     print(f"Found {len(files)} files. Starting SynthSeg...")
+
+    # Run SynthSeg once over the whole folder so TensorFlow builds/loads the
+    # network a single time instead of reinitialising DNN state for every scan.
+    predict(
+        path_images=INPUT_DIR,
+        path_segmentations=segmentation_dir,
+        path_model=PATH_MODEL,
+        labels_segmentation=PATH_LABELS,
+        cropping=None,  # Can set to e.g. [192, 192, 192] if you run out of memory
+        recompute=True
+    )
     
     all_results = []
     
     for f in tqdm(files):
         try:
             full_path = os.path.join(INPUT_DIR, f)
-            result = process_brain_mri(full_path, OUTPUT_DIR)
+            seg_path = get_segmentation_path(full_path, segmentation_dir)
+            result = extract_volumes(full_path, seg_path)
             all_results.append(result)
+            if not SAVE_SEGMENTATION and os.path.exists(seg_path):
+                os.remove(seg_path)
         except Exception as e:
             import traceback
             traceback.print_exc()
