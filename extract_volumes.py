@@ -7,6 +7,7 @@ USE_GPU = os.environ.get("USE_SYNTHSEG_GPU", "0") == "1"
 if not USE_GPU:
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,8 @@ tf.config.threading.set_intra_op_parallelism_threads(TF_THREADS)
 if USE_GPU:
     for gpu in tf.config.list_physical_devices("GPU"):
         tf.config.experimental.set_memory_growth(gpu, True)
+else:
+    tf.config.set_visible_devices([], "GPU")
 
 # Correct Import for the official SynthSeg Repo
 from SynthSeg.predict import predict
