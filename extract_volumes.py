@@ -41,8 +41,8 @@ else:
 from SynthSeg.predict import predict
 
 # --- CONFIGURATION ---
-INPUT_DIR = '../outputs'
-OUTPUT_DIR = '../evals'
+INPUT_DIR = '../Outputs-LoHiResGAN'
+OUTPUT_DIR = '../evals-SR-LoHiResGAN'
 CSV_FILENAME = 'brain_volumes.csv'
 SAVE_SEGMENTATION = False  # Set to True to keep .nii files, False to delete them after extraction
 

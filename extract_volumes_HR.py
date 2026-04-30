@@ -51,9 +51,9 @@ from SynthSeg.predict import predict
 
 # --- CONFIGURATION ---
 INPUT_DIR = "../processed/HR"
-OUTPUT_DIR = "../evals-HR"
+OUTPUT_DIR = "../evals-HR-LoHiResGAN"
 CSV_FILENAME = "brain_volumes.csv"
-SOURCE_CSV_PATH = "../evals-SR/brain_volumes.csv"  
+SOURCE_CSV_PATH = "../evals-SR-LoHiResGAN/brain_volumes.csv"  
 SAVE_SEGMENTATION = False
 
 # Standard FreeSurfer ColorLUT mapping for SynthSeg
