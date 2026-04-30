@@ -1,4 +1,5 @@
 import os
+import sys
 
 # TensorFlow must see this before it is imported by SynthSeg. The original
 # crash is usually caused by TensorFlow finding a GPU but failing to initialise
@@ -8,22 +9,30 @@ if not USE_GPU:
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+if USE_GPU and os.environ.get("SYNTHSEG_CUDNN_PATH_FIXED") != "1":
+    pip_cudnn_lib = "/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib"
+    if os.path.isdir(pip_cudnn_lib):
+        current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+        ld_paths = [p for p in current_ld_path.split(":") if p]
+        if not ld_paths or ld_paths[0] != pip_cudnn_lib:
+            env = os.environ.copy()
+            env["SYNTHSEG_CUDNN_PATH_FIXED"] = "1"
+            env["LD_LIBRARY_PATH"] = pip_cudnn_lib + (":" + current_ld_path if current_ld_path else "")
+            os.execvpe("python", ["python", *sys.argv], env)
 
 import numpy as np
 import pandas as pd
 import nibabel as nib
 from tqdm import tqdm
-import sys
 
 # --- SETUP PATHS ---
-# Add the cloned repo to Python path so we can import modules from it
 # The structure is synseg_model (outer) -> synseg_model (inner) -> SynthSeg (package)
-REPO_PATH = os.path.join(os.getcwd(), 'synseg_model', 'synseg_model')
+REPO_PATH = os.path.join(os.getcwd(), "synseg_model", "synseg_model")
 sys.path.append(REPO_PATH)
 
 # Define paths to model and labels
-PATH_MODEL = os.path.join(REPO_PATH, 'models', 'synthseg_1.0.h5')
-PATH_LABELS = os.path.join(REPO_PATH, 'data', 'labels_classes_priors', 'synthseg_segmentation_labels.npy')
+PATH_MODEL = os.path.join(REPO_PATH, "models", "synthseg_1.0.h5")
+PATH_LABELS = os.path.join(REPO_PATH, "data", "labels_classes_priors", "synthseg_segmentation_labels.npy")
 
 # Configure TensorFlow before importing SynthSeg's prediction module.
 import tensorflow as tf
@@ -41,10 +50,11 @@ else:
 from SynthSeg.predict import predict
 
 # --- CONFIGURATION ---
-INPUT_DIR = '../outputs'
-OUTPUT_DIR = '../evals'
-CSV_FILENAME = 'brain_volumes.csv'
-SAVE_SEGMENTATION = False  # Set to True to keep .nii files, False to delete them after extraction
+INPUT_DIR = "../inout"
+OUTPUT_DIR = "../evals"
+CSV_FILENAME = "brain_volumes.csv"
+SOURCE_CSV_PATH = "../evals-SR/brain_volumes.csv"  
+SAVE_SEGMENTATION = False
 
 # Standard FreeSurfer ColorLUT mapping for SynthSeg
 LABEL_MAP = {
@@ -79,14 +89,16 @@ LABEL_MAP = {
     53: "Right Hippocampus",
     54: "Right Amygdala",
     58: "Right Accumbens Area",
-    60: "Right Ventral DC"
+    60: "Right Ventral DC",
 }
+
 
 def get_voxel_volume(nii_img):
     """Calculates the volume of a single voxel in mm^3."""
     header = nii_img.header
     zooms = header.get_zooms()
     return np.prod(zooms)
+
 
 def get_segmentation_path(input_path, segmentation_folder):
     filename = os.path.basename(input_path)
@@ -102,46 +114,99 @@ def extract_volumes(input_path, seg_output_path):
     seg_img = nib.load(seg_output_path)
     seg_data = seg_img.get_fdata()
     voxel_vol_mm3 = get_voxel_volume(seg_img)
-    
+
     unique, counts = np.unique(seg_data, return_counts=True)
     stats = dict(zip(unique.astype(int), counts))
-    
-    volumes = {'Filename': filename}
-    
+
+    volumes = {"Filename": filename}
+
     for label_id, label_name in LABEL_MAP.items():
         count = stats.get(label_id, 0)
         volumes[label_name] = count * voxel_vol_mm3
 
     return volumes
 
+
+def remove_last_sr_part(filename):
+    """
+    Remove only the final '_sr' immediately before NIfTI extension.
+    Example:
+      101309_T2w_inplane_ds2_sr.nii.gz -> 101309_T2w_inplane_ds2.nii.gz
+    """
+    if filename.endswith("_sr.nii.gz"):
+        return filename[:-10] + ".nii.gz"
+    if filename.endswith("_sr.nii"):
+        return filename[:-7] + ".nii"
+    return filename
+
+
+def dedupe_keep_order(items):
+    seen = set()
+    unique_items = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            unique_items.append(item)
+    return unique_items
+
+
+def build_target_filenames(source_csv_path):
+    df = pd.read_csv(source_csv_path)
+    if "Filename" not in df.columns:
+        raise ValueError(f"'Filename' column not found in {source_csv_path}")
+
+    filenames = [remove_last_sr_part(name.strip()) for name in df["Filename"].dropna().astype(str)]
+    return dedupe_keep_order(filenames)
+
+
+def write_path_list(path, items):
+    with open(path, "w", encoding="utf-8") as f:
+        for item in items:
+            f.write(item + "\n")
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     segmentation_dir = os.path.join(OUTPUT_DIR, "synthseg_segmentations")
     os.makedirs(segmentation_dir, exist_ok=True)
-    
-    # Filter for NIfTI files
-    files = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(('.nii', '.nii.gz')))
-    
-    if not files:
-        print(f"No NIfTI files found in {INPUT_DIR}")
-        print("Please add .nii or .nii.gz files to the 'inputs' folder.")
+
+    target_files = build_target_filenames(SOURCE_CSV_PATH)
+    if not target_files:
+        print(f"No valid filenames generated from {SOURCE_CSV_PATH}")
         return
 
-    print(f"Found {len(files)} files. Starting SynthSeg...")
+    available_files = set(os.listdir(INPUT_DIR))
+    files = [f for f in target_files if f in available_files]
+    missing_files = [f for f in target_files if f not in available_files]
 
-    # Run SynthSeg once over the whole folder so TensorFlow builds/loads the
-    # network a single time instead of reinitialising DNN state for every scan.
+    if missing_files:
+        print(f"Warning: {len(missing_files)} files not found in {INPUT_DIR}")
+        print("First few missing files:", missing_files[:10])
+
+    if not files:
+        print(f"No requested NIfTI files found in {INPUT_DIR}")
+        return
+
+    print(f"Found {len(files)} target files from CSV. Starting SynthSeg...")
+
+    input_list_path = os.path.join(OUTPUT_DIR, "lr_synthseg_inputs.txt")
+    output_list_path = os.path.join(OUTPUT_DIR, "lr_synthseg_outputs.txt")
+    input_paths = [os.path.join(INPUT_DIR, f) for f in files]
+    output_paths = [get_segmentation_path(path, segmentation_dir) for path in input_paths]
+    write_path_list(input_list_path, input_paths)
+    write_path_list(output_list_path, output_paths)
+
+    # Run SynthSeg once so TensorFlow loads cuDNN/model state a single time.
     predict(
-        path_images=INPUT_DIR,
-        path_segmentations=segmentation_dir,
+        path_images=input_list_path,
+        path_segmentations=output_list_path,
         path_model=PATH_MODEL,
         labels_segmentation=PATH_LABELS,
-        cropping=None,  # Can set to e.g. [192, 192, 192] if you run out of memory
-        recompute=True
+        cropping=None,
+        recompute=True,
     )
-    
+
     all_results = []
-    
     for f in tqdm(files):
         try:
             full_path = os.path.join(INPUT_DIR, f)
@@ -151,17 +216,16 @@ def main():
             if not SAVE_SEGMENTATION and os.path.exists(seg_path):
                 os.remove(seg_path)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"Error processing {f}: {e}")
+            print(f"Error extracting volumes for {f}: {e}")
 
     if all_results:
         df = pd.DataFrame(all_results)
-        cols = ['Filename'] + [c for c in df.columns if c != 'Filename']
+        cols = ["Filename"] + [c for c in df.columns if c != "Filename"]
         df = df[cols]
         output_csv_path = os.path.join(OUTPUT_DIR, CSV_FILENAME)
         df.to_csv(output_csv_path, index=False)
         print(f"\nSuccess! Results saved to: {output_csv_path}")
+
 
 if __name__ == "__main__":
     main()
