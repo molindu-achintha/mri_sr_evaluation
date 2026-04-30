@@ -50,8 +50,8 @@ else:
 from SynthSeg.predict import predict
 
 # --- CONFIGURATION ---
-INPUT_DIR = "../inout"
-OUTPUT_DIR = "../evals"
+INPUT_DIR = "../processed/LR"
+OUTPUT_DIR = "../evals-LR"
 CSV_FILENAME = "brain_volumes.csv"
 SOURCE_CSV_PATH = "../evals-SR/brain_volumes.csv"  
 SAVE_SEGMENTATION = False
