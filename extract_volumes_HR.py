@@ -1,4 +1,5 @@
 import os
+import sys
 
 # TensorFlow must see this before it is imported by SynthSeg. The original
 # crash is usually caused by TensorFlow finding a GPU but failing to initialise
@@ -8,12 +9,21 @@ if not USE_GPU:
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+if USE_GPU and os.environ.get("SYNTHSEG_CUDNN_PATH_FIXED") != "1":
+    pip_cudnn_lib = "/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib"
+    if os.path.isdir(pip_cudnn_lib):
+        current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+        ld_paths = [p for p in current_ld_path.split(":") if p]
+        if not ld_paths or ld_paths[0] != pip_cudnn_lib:
+            env = os.environ.copy()
+            env["SYNTHSEG_CUDNN_PATH_FIXED"] = "1"
+            env["LD_LIBRARY_PATH"] = pip_cudnn_lib + (":" + current_ld_path if current_ld_path else "")
+            os.execvpe("python", ["python", *sys.argv], env)
 
 import numpy as np
 import pandas as pd
 import nibabel as nib
 from tqdm import tqdm
-import sys
 
 # --- SETUP PATHS ---
 # The structure is synseg_model (outer) -> synseg_model (inner) -> SynthSeg (package)
@@ -143,6 +153,12 @@ def dedupe_keep_order(items):
     return unique_items
 
 
+def write_path_list(path, items):
+    with open(path, "w", encoding="utf-8") as f:
+        for item in items:
+            f.write(item + "\n")
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     segmentation_dir = os.path.join(OUTPUT_DIR, "synthseg_segmentations")
@@ -168,21 +184,22 @@ def main():
 
     print(f"Found {len(files)} target files from CSV. Starting SynthSeg...")
 
-    # Process each selected file (predict() accepts one path at a time here).
-    for f in tqdm(files):
-        full_path = os.path.join(INPUT_DIR, f)
-        seg_path = get_segmentation_path(full_path, segmentation_dir)
-        try:
-            predict(
-                path_images=full_path,
-                path_segmentations=seg_path,
-                path_model=PATH_MODEL,
-                labels_segmentation=PATH_LABELS,
-                cropping=None,
-                recompute=True,
-            )
-        except Exception as e:
-            print(f"Error running SynthSeg for {f}: {e}")
+    input_list_path = os.path.join(OUTPUT_DIR, "hr_synthseg_inputs.txt")
+    output_list_path = os.path.join(OUTPUT_DIR, "hr_synthseg_outputs.txt")
+    input_paths = [os.path.join(INPUT_DIR, f) for f in files]
+    output_paths = [get_segmentation_path(path, segmentation_dir) for path in input_paths]
+    write_path_list(input_list_path, input_paths)
+    write_path_list(output_list_path, output_paths)
+
+    # Run SynthSeg once so TensorFlow loads cuDNN/model state a single time.
+    predict(
+        path_images=input_list_path,
+        path_segmentations=output_list_path,
+        path_model=PATH_MODEL,
+        labels_segmentation=PATH_LABELS,
+        cropping=None,
+        recompute=True,
+    )
 
     all_results = []
     for f in tqdm(files):
