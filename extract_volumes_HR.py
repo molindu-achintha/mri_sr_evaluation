@@ -16,14 +16,13 @@ from tqdm import tqdm
 import sys
 
 # --- SETUP PATHS ---
-# Add the cloned repo to Python path so we can import modules from it
 # The structure is synseg_model (outer) -> synseg_model (inner) -> SynthSeg (package)
-REPO_PATH = os.path.join(os.getcwd(), 'synseg_model', 'synseg_model')
+REPO_PATH = os.path.join(os.getcwd(), "synseg_model", "synseg_model")
 sys.path.append(REPO_PATH)
 
 # Define paths to model and labels
-PATH_MODEL = os.path.join(REPO_PATH, 'models', 'synthseg_1.0.h5')
-PATH_LABELS = os.path.join(REPO_PATH, 'data', 'labels_classes_priors', 'synthseg_segmentation_labels.npy')
+PATH_MODEL = os.path.join(REPO_PATH, "models", "synthseg_1.0.h5")
+PATH_LABELS = os.path.join(REPO_PATH, "data", "labels_classes_priors", "synthseg_segmentation_labels.npy")
 
 # Configure TensorFlow before importing SynthSeg's prediction module.
 import tensorflow as tf
@@ -41,10 +40,11 @@ else:
 from SynthSeg.predict import predict
 
 # --- CONFIGURATION ---
-INPUT_DIR = '../processed/HR'
-OUTPUT_DIR = '../evals'
-CSV_FILENAME = 'brain_volumes.csv'
-SAVE_SEGMENTATION = False  # Set to True to keep .nii files, False to delete them after extraction
+INPUT_DIR = "../processed/HR"
+OUTPUT_DIR = "../evals-HR"
+CSV_FILENAME = "brain_volumes.csv"
+SOURCE_CSV_PATH = "../evals-SR/brain_volumes.csv"  
+SAVE_SEGMENTATION = False
 
 # Standard FreeSurfer ColorLUT mapping for SynthSeg
 LABEL_MAP = {
@@ -79,14 +79,15 @@ LABEL_MAP = {
     53: "Right Hippocampus",
     54: "Right Amygdala",
     58: "Right Accumbens Area",
-    60: "Right Ventral DC"
+    60: "Right Ventral DC",
 }
+
 
 def get_voxel_volume(nii_img):
     """Calculates the volume of a single voxel in mm^3."""
-    header = nii_img.header
-    zooms = header.get_zooms()
+    zooms = nii_img.header.get_zooms()
     return np.prod(zooms)
+
 
 def get_segmentation_path(input_path, segmentation_folder):
     filename = os.path.basename(input_path)
@@ -97,51 +98,93 @@ def get_segmentation_path(input_path, segmentation_folder):
 
 def extract_volumes(input_path, seg_output_path):
     filename = os.path.basename(input_path)
-
-    # Calculate volumes from the SynthSeg segmentation.
     seg_img = nib.load(seg_output_path)
     seg_data = seg_img.get_fdata()
     voxel_vol_mm3 = get_voxel_volume(seg_img)
-    
+
     unique, counts = np.unique(seg_data, return_counts=True)
     stats = dict(zip(unique.astype(int), counts))
-    
-    volumes = {'Filename': filename}
-    
+
+    volumes = {"Filename": filename}
     for label_id, label_name in LABEL_MAP.items():
         count = stats.get(label_id, 0)
         volumes[label_name] = count * voxel_vol_mm3
-
     return volumes
+
+
+def build_target_filenames(source_csv_path):
+    """
+    Convert source CSV Filename values to `id_T2w.nii.gz`.
+    Example:
+      101309_T2w_inplane_ds2_sr.nii.gz -> 101309_T2w.nii.gz
+    """
+    df = pd.read_csv(source_csv_path)
+    if "Filename" not in df.columns:
+        raise ValueError(f"'Filename' column not found in {source_csv_path}")
+
+    filenames = []
+    for raw_name in df["Filename"].dropna().astype(str):
+        subject_id = raw_name.split("_", 1)[0].strip()
+        if subject_id:
+            filenames.append(f"{subject_id}_T2w.nii.gz")
+
+    # Keep deterministic ordering and remove duplicates
+    return sorted(set(filenames))
+
+
+def dedupe_keep_order(items):
+    """Remove duplicates while preserving first-seen order."""
+    seen = set()
+    unique_items = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            unique_items.append(item)
+    return unique_items
+
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     segmentation_dir = os.path.join(OUTPUT_DIR, "synthseg_segmentations")
     os.makedirs(segmentation_dir, exist_ok=True)
-    
-    # Filter for NIfTI files
-    files = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(('.nii', '.nii.gz')))
-    
-    if not files:
-        print(f"No NIfTI files found in {INPUT_DIR}")
-        print("Please add .nii or .nii.gz files to the 'inputs' folder.")
+
+    target_files = build_target_filenames(SOURCE_CSV_PATH)
+    if not target_files:
+        print(f"No valid filenames generated from {SOURCE_CSV_PATH}")
         return
 
-    print(f"Found {len(files)} files. Starting SynthSeg...")
+    available_files = set(os.listdir(INPUT_DIR))
+    files = [f for f in target_files if f in available_files]
+    files = dedupe_keep_order(files)
+    missing_files = [f for f in target_files if f not in available_files]
 
-    # Run SynthSeg once over the whole folder so TensorFlow builds/loads the
-    # network a single time instead of reinitialising DNN state for every scan.
-    predict(
-        path_images=INPUT_DIR,
-        path_segmentations=segmentation_dir,
-        path_model=PATH_MODEL,
-        labels_segmentation=PATH_LABELS,
-        cropping=None,  # Can set to e.g. [192, 192, 192] if you run out of memory
-        recompute=True
-    )
-    
+    if missing_files:
+        print(f"Warning: {len(missing_files)} files not found in {INPUT_DIR}.")
+        print("First few missing files:", missing_files[:10])
+
+    if not files:
+        print(f"No requested NIfTI files found in {INPUT_DIR}")
+        return
+
+    print(f"Found {len(files)} target files from CSV. Starting SynthSeg...")
+
+    # Process each selected file (predict() accepts one path at a time here).
+    for f in tqdm(files):
+        full_path = os.path.join(INPUT_DIR, f)
+        seg_path = get_segmentation_path(full_path, segmentation_dir)
+        try:
+            predict(
+                path_images=full_path,
+                path_segmentations=seg_path,
+                path_model=PATH_MODEL,
+                labels_segmentation=PATH_LABELS,
+                cropping=None,
+                recompute=True,
+            )
+        except Exception as e:
+            print(f"Error running SynthSeg for {f}: {e}")
+
     all_results = []
-    
     for f in tqdm(files):
         try:
             full_path = os.path.join(INPUT_DIR, f)
@@ -151,17 +194,16 @@ def main():
             if not SAVE_SEGMENTATION and os.path.exists(seg_path):
                 os.remove(seg_path)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"Error processing {f}: {e}")
+            print(f"Error extracting volumes for {f}: {e}")
 
     if all_results:
         df = pd.DataFrame(all_results)
-        cols = ['Filename'] + [c for c in df.columns if c != 'Filename']
+        cols = ["Filename"] + [c for c in df.columns if c != "Filename"]
         df = df[cols]
         output_csv_path = os.path.join(OUTPUT_DIR, CSV_FILENAME)
         df.to_csv(output_csv_path, index=False)
         print(f"\nSuccess! Results saved to: {output_csv_path}")
+
 
 if __name__ == "__main__":
     main()
